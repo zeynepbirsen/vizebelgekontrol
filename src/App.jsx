@@ -17,6 +17,7 @@ import {
   Stamp,
   BadgeCheck,
 } from "lucide-react";
+import { supabase } from "./supabaseClient.js";
 
 /* ------------------------------------------------------------------
    TOKENS
@@ -34,16 +35,20 @@ const SCHENGEN_IDS = new Set([
   "SK", "SI", "ES", "SE", "CH",
 ]);
 
-// Diğer Avrupa ülkeleri — evrak modeli genel/temel bir taban olarak
-// kullanılıyor; her ülkenin kendi konsolosluk gereklilikleri farklılık
-// gösterebileceğinden Belgeler adımında ayrıca uyarı gösteriliyor.
+// Diğer Avrupa ülkeleri — yalnızca Türk vatandaşları için GERÇEKTEN vize
+// gerektiren (ya da yakında gerektirecek) ülkeler. Arnavutluk, Bosna-Hersek,
+// Belarus, Kosova, Moldova, Kuzey Makedonya, Sırbistan ve Ukrayna kısa süreli
+// (30-90 gün) seyahatlerde vizesiz olduğu için listeye alınmadı — bu ülkeler
+// için kullanıcının boşuna evrak listesi oluşturmasını istemiyoruz.
+// Andorra, Monako, San Marino ve Vatikan'ın kendi vize sistemi yok; giriş
+// komşu Schengen ülkesinin (Fransa/İtalya) sınırından yapılıyor, bu yüzden
+// ayrı bir "ülke" olarak listelenmiyor.
 const OTHER_EUROPE = [
-  ["AL", "Arnavutluk"], ["AD", "Andorra"], ["BA", "Bosna-Hersek"],
-  ["BY", "Belarus"], ["CY", "Kıbrıs"], ["GB", "Birleşik Krallık"],
-  ["IE", "İrlanda"], ["XK", "Kosova"], ["MC", "Monako"], ["MD", "Moldova"],
-  ["MK", "Kuzey Makedonya"], ["ME", "Karadağ"], ["RU", "Rusya"],
-  ["SM", "San Marino"], ["RS", "Sırbistan"], ["UA", "Ukrayna"],
-  ["VA", "Vatikan"],
+  ["CY", "Kıbrıs", "Kıbrıs Cumhuriyeti'ne (Güney Kıbrıs) seyahat için Ulusal Vize gereklidir; başvuru Atina Büyükelçiliği üzerinden yapılır."],
+  ["GB", "Birleşik Krallık", null],
+  ["IE", "İrlanda", null],
+  ["ME", "Karadağ", "ÖNEMLİ: Karadağ, 1 Kasım 2026 itibarıyla Türk vatandaşları için 30 günlük vize muafiyetini kaldırıyor. Bu tarihten sonraki seyahatler için vize gerekecek; öncesi için güncel durumu mutlaka teyit edin."],
+  ["RU", "Rusya", "Umuma mahsus (bordo) pasaport sahipleri için vize gereklidir; yalnızca diplomatik/hususi/hizmet pasaport sahipleri 30 güne kadar muaftır."],
 ];
 
 const SCHENGEN_LABELS = {
@@ -63,10 +68,11 @@ const COUNTRIES = [
     schengen: true,
     source: `${label} için resmî vize başvuru merkezi bilgilendirmesi`,
   })).sort((a, b) => a.label.localeCompare(b.label, "tr")),
-  ...OTHER_EUROPE.map(([id, label]) => ({
+  ...OTHER_EUROPE.map(([id, label, specialNote]) => ({
     id,
     label,
     schengen: false,
+    specialNote,
     source: `${label} büyükelçiliği/başvuru merkezi resmî bilgilendirmesi`,
   })).sort((a, b) => a.label.localeCompare(b.label, "tr")),
 ];
@@ -298,7 +304,7 @@ function Stepper({ step }) {
 /* ------------------------------------------------------------------
    NAVBAR
 ------------------------------------------------------------------- */
-function NavBar({ onHome }) {
+function NavBar({ onHome, session, onLoginClick, onLogout, onHistoryClick }) {
   const [open, setOpen] = useState(false);
   return (
     <header className="nav">
@@ -315,7 +321,15 @@ function NavBar({ onHome }) {
           <a href="#nasil-calisir">Nasıl çalışır?</a>
           <a href="#guvenlik">Güvenlik</a>
           <a href="#sss">Sık Sorulanlar</a>
-          <button className="nav__login" type="button">Giriş Yap</button>
+          {session ? (
+            <>
+              <button className="nav__link-btn" type="button" onClick={onHistoryClick}>Geçmişim</button>
+              <span className="nav__user-email" title={session.user.email}>{session.user.email}</span>
+              <button className="nav__login" type="button" onClick={onLogout}>Çıkış yap</button>
+            </>
+          ) : (
+            <button className="nav__login" type="button" onClick={onLoginClick}>Giriş Yap</button>
+          )}
         </nav>
         <button
           className="nav__toggle"
@@ -331,10 +345,244 @@ function NavBar({ onHome }) {
           <a href="#nasil-calisir" onClick={() => setOpen(false)}>Nasıl çalışır?</a>
           <a href="#guvenlik" onClick={() => setOpen(false)}>Güvenlik</a>
           <a href="#sss" onClick={() => setOpen(false)}>Sık Sorulanlar</a>
-          <button className="nav__login" type="button">Giriş Yap</button>
+          {session ? (
+            <>
+              <button className="nav__link-btn" type="button" onClick={() => { setOpen(false); onHistoryClick(); }}>Geçmişim</button>
+              <button className="nav__login" type="button" onClick={() => { setOpen(false); onLogout(); }}>Çıkış yap ({session.user.email})</button>
+            </>
+          ) : (
+            <button className="nav__login" type="button" onClick={() => { setOpen(false); onLoginClick(); }}>Giriş Yap</button>
+          )}
         </nav>
       )}
     </header>
+  );
+}
+
+/* ------------------------------------------------------------------
+   GİRİŞ / KAYIT MODALİ
+------------------------------------------------------------------- */
+function AuthModal({ onClose, onSuccess }) {
+  const [mode, setMode] = useState("login"); // "login" | "signup"
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError("");
+    setNotice("");
+    if (!supabase) {
+      setError("Giriş sistemi henüz yapılandırılmadı. Lütfen daha sonra tekrar deneyin.");
+      return;
+    }
+    setBusy(true);
+    try {
+      if (mode === "signup") {
+        const { error: signUpError } = await supabase.auth.signUp({ email, password });
+        if (signUpError) throw signUpError;
+        setNotice("Kayıt oluşturuldu. E-postanıza gelen bağlantıyla hesabınızı onaylayıp giriş yapabilirsiniz.");
+      } else {
+        const { error: signInError } = await supabase.auth.signInWithPassword({ email, password });
+        if (signInError) throw signInError;
+        onSuccess?.();
+      }
+    } catch (err) {
+      setError(err.message || "Bir hata oluştu, lütfen tekrar deneyin.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal-overlay" role="dialog" aria-modal="true" aria-label="Giriş yap veya kayıt ol">
+      <div className="modal-card">
+        <button className="modal-close" onClick={onClose} aria-label="Kapat"><X size={18} /></button>
+        <h2 className="card__title">{mode === "login" ? "Giriş yap" : "Hesap oluştur"}</h2>
+        <p className="card__sub">
+          {mode === "login"
+            ? "Geçmiş kontrollerinizi görebilmek için giriş yapın."
+            : "İlk kontrolünüz ücretsiz — hesap oluşturup hemen başlayabilirsiniz."}
+        </p>
+        <form onSubmit={submit} className="auth-form">
+          <div className="field">
+            <label htmlFor="auth-email">E-posta</label>
+            <input
+              id="auth-email"
+              type="email"
+              required
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              autoComplete="email"
+            />
+          </div>
+          <div className="field">
+            <label htmlFor="auth-password">Şifre</label>
+            <input
+              id="auth-password"
+              type="password"
+              required
+              minLength={6}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              autoComplete={mode === "login" ? "current-password" : "new-password"}
+            />
+          </div>
+          {error && <p className="field__err">{error}</p>}
+          {notice && <p className="auth-notice">{notice}</p>}
+          <button type="submit" className="btn btn--primary" disabled={busy} style={{ width: "100%", justifyContent: "center" }}>
+            {busy ? "Lütfen bekleyin…" : mode === "login" ? "Giriş yap" : "Kayıt ol"}
+          </button>
+        </form>
+        <button
+          type="button"
+          className="auth-switch"
+          onClick={() => { setMode(mode === "login" ? "signup" : "login"); setError(""); setNotice(""); }}
+        >
+          {mode === "login" ? "Hesabınız yok mu? Kayıt olun" : "Zaten hesabınız var mı? Giriş yapın"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------
+   ÖDEME GEREKLİ EKRANI
+------------------------------------------------------------------- */
+function PaymentRequired({ onBack }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [formHtml, setFormHtml] = useState(null);
+  const containerRef = useRef(null);
+
+  React.useEffect(() => {
+    if (!formHtml || !containerRef.current) return;
+    containerRef.current.innerHTML = formHtml;
+    // Enjekte edilen HTML içindeki <script> etiketleri innerHTML ile
+    // otomatik çalışmaz — bu yüzden onları bulup yeniden oluşturuyoruz.
+    const scripts = containerRef.current.querySelectorAll("script");
+    scripts.forEach((oldScript) => {
+      const newScript = document.createElement("script");
+      Array.from(oldScript.attributes).forEach((attr) => newScript.setAttribute(attr.name, attr.value));
+      newScript.textContent = oldScript.textContent;
+      oldScript.replaceWith(newScript);
+    });
+  }, [formHtml]);
+
+  const startPayment = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      const token = sessionData?.session?.access_token;
+      const callbackUrl = `${window.location.origin}/.netlify/functions/payment-webhook`;
+      const res = await fetch("/.netlify/functions/create-payment", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ callbackUrl }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error || "Ödeme başlatılamadı.");
+        return;
+      }
+      setFormHtml(data.checkoutFormContent);
+    } catch (err) {
+      setError("Ödeme başlatılırken bir hata oluştu, lütfen tekrar deneyin.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="card">
+      <h2 className="card__title">Ücretsiz hakkınızı kullandınız</h2>
+      <p className="card__sub">
+        İlk kontrolünüz ücretsizdi. Devam etmek için 99 TL karşılığında ek bir kontrol satın
+        alabilirsiniz.
+      </p>
+      {!formHtml && (
+        <>
+          <button className="btn btn--primary" onClick={startPayment} disabled={busy}>
+            {busy ? "Yönlendiriliyor…" : "99 TL öde ve devam et"}
+          </button>
+          {error && <p className="field__err" style={{ marginTop: 10 }}>{error}</p>}
+        </>
+      )}
+      <div ref={containerRef} />
+      <div className="card__actions">
+        <button type="button" className="btn btn--ghost" onClick={onBack}>
+          <ChevronLeft size={16} /> Geri
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------
+   GEÇMİŞİM
+------------------------------------------------------------------- */
+function HistoryView({ onBack, onOpenReport }) {
+  const [reports, setReports] = useState(null);
+  const [error, setError] = useState("");
+
+  React.useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      if (!supabase) {
+        setError("Giriş sistemi henüz yapılandırılmadı.");
+        return;
+      }
+      const { data, error: fetchError } = await supabase
+        .from("reports")
+        .select("id, form_data, report_data, demo_mode, created_at")
+        .order("created_at", { ascending: false });
+      if (cancelled) return;
+      if (fetchError) {
+        setError("Geçmiş raporlar yüklenemedi.");
+        return;
+      }
+      setReports(data || []);
+    }
+    load();
+    return () => { cancelled = true; };
+  }, []);
+
+  return (
+    <div className="card">
+      <h2 className="card__title">Geçmişim</h2>
+      <p className="card__sub">Daha önce oluşturduğunuz kontrol raporları.</p>
+
+      {error && <p className="field__err">{error}</p>}
+      {!error && reports === null && <p className="card__sub">Yükleniyor…</p>}
+      {!error && reports && reports.length === 0 && (
+        <p className="card__sub">Henüz bir kontrol yapmadınız.</p>
+      )}
+
+      <div className="history-list">
+        {reports?.map((r) => {
+          const country = COUNTRIES.find((c) => c.id === r.form_data?.country)?.label || r.form_data?.country;
+          const date = new Date(r.created_at).toLocaleString("tr-TR");
+          return (
+            <button key={r.id} className="history-item" onClick={() => onOpenReport(r)}>
+              <div>
+                <p className="history-item__title">{country} · {r.form_data?.visaType}</p>
+                <p className="history-item__date">{date}{r.demo_mode ? " · Demo modu" : ""}</p>
+              </div>
+              <ChevronRight size={16} />
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="card__actions card__actions--end">
+        <button type="button" className="btn btn--ghost" onClick={onBack}>
+          <ChevronLeft size={16} /> Geri
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -407,20 +655,36 @@ function Landing({ onStart }) {
           </div>
           <div className="info-card">
             <span className="info-card__num">3</span>
-            <h3>Kontrol raporunuzu alın</h3>
-            <p>Eksikler, düzeltilmesi gerekenler ve öneriler tek bir raporda sunulur.</p>
+            <h3>Yapay zekâ kontrolünü alın</h3>
+            <p>Belgeleriniz yapay zekâ ile analiz edilir; eksikler, düzeltilmesi gerekenler ve öneriler tek bir raporda sunulur.</p>
           </div>
         </div>
       </section>
 
       <section id="guvenlik" className="info-section info-section--muted">
         <h2>Güvenlik</h2>
-        <div className="security-row">
-          <Lock size={20} />
-          <p>
-            Belgeleriniz yalnızca kontrol amacıyla işlenir ve analiz tamamlandıktan sonra silinir.
-            Bilgileriniz üçüncü taraflarla paylaşılmaz.
-          </p>
+        <div className="security-grid">
+          <div className="security-item">
+            <Lock size={18} />
+            <div>
+              <h3>Kalıcı saklama yok</h3>
+              <p>Belgeleriniz analiz sırasında yalnızca geçici olarak işlenir; işlem bitince sistemden silinir.</p>
+            </div>
+          </div>
+          <div className="security-item">
+            <ShieldCheck size={18} />
+            <div>
+              <h3>Bot ve kötüye kullanım koruması</h3>
+              <p>İnsan doğrulaması (Cloudflare Turnstile), istek başına hız sınırlama ve günlük kullanım kotası ile korunuyoruz.</p>
+            </div>
+          </div>
+          <div className="security-item">
+            <Info size={18} />
+            <div>
+              <h3>Şeffaf üçüncü taraf kullanımı</h3>
+              <p>Analiz, ABD merkezli yapay zekâ sağlayıcısı Anthropic (Claude) üzerinden yapılır. Bunu gizlemiyoruz — Belgeler adımındaki Aydınlatma Metni'nde açıkça belirtiyoruz.</p>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -436,11 +700,29 @@ function Landing({ onStart }) {
           </details>
           <details>
             <summary>Hangi ülkeler için evrak listesi oluşturabilirim?</summary>
-            <p>Schengen bölgesindeki 29 ülke dahil olmak üzere, Avrupa'daki tüm ülkeler için kişiselleştirilmiş listeler sunuyoruz.</p>
+            <p>
+              Schengen bölgesindeki 29 ülkenin tamamı, ayrıca Birleşik Krallık, İrlanda, Kıbrıs,
+              Rusya ve Karadağ için kişiselleştirilmiş listeler sunuyoruz. Türk vatandaşlarının
+              kısa süreli seyahatlerde zaten vizesiz girebildiği Balkan ülkeleri (Sırbistan,
+              Bosna-Hersek, Kuzey Makedonya, Arnavutluk, Kosova), Belarus, Moldova ve Ukrayna
+              listede yer almıyor — çünkü bu ülkeler için vize başvurusuna gerek yok.
+            </p>
           </details>
           <details>
-            <summary>Belgelerim ne kadar süre saklanıyor?</summary>
-            <p>Belgeleriniz yalnızca analiz süresince işlenir ve tamamlandıktan sonra silinir.</p>
+            <summary>Belgelerim ne kadar süre saklanıyor ve nereye gidiyor?</summary>
+            <p>
+              Belgeleriniz analiz için Anthropic'in (Claude) yapay zekâ servisine gönderilir,
+              yalnızca analiz süresince işlenir ve tamamlandıktan hemen sonra silinir. Ayrıntılar
+              için Belgeler adımındaki Aydınlatma Metni'ne bakabilirsiniz.
+            </p>
+          </details>
+          <details>
+            <summary>Karadağ neden farklı görünüyor?</summary>
+            <p>
+              Karadağ, Türk vatandaşları için 1 Kasım 2026'ya kadar vizesiz; bu tarihten sonra
+              vize zorunlu hâle geliyor. Bu geçiş dönemi nedeniyle listede özel bir uyarıyla yer
+              alıyor.
+            </p>
           </details>
         </div>
       </section>
@@ -783,12 +1065,16 @@ function StepDocuments({
       </p>
 
       {country && !country.schengen && (
-        <div className="schengen-note">
+        <div className={`schengen-note ${country.specialNote ? "schengen-note--warn" : ""}`}>
           <Info size={16} />
           <p>
-            {country.label} Schengen bölgesi dışındadır. Aşağıdaki liste genel bir taban olarak
-            hazırlanmıştır; kesin gereklilikler için {country.label} büyükelçiliği veya
-            başvuru merkezinin güncel bilgilerini mutlaka kontrol edin.
+            {country.specialNote || (
+              <>
+                {country.label} Schengen bölgesi dışındadır. Aşağıdaki liste genel bir taban
+                olarak hazırlanmıştır; kesin gereklilikler için {country.label} büyükelçiliği
+                veya başvuru merkezinin güncel bilgilerini mutlaka kontrol edin.
+              </>
+            )}
           </p>
         </div>
       )}
@@ -804,13 +1090,38 @@ function StepDocuments({
         <p>Belgeleriniz yalnızca kontrol amacıyla işlenir ve analiz tamamlandıktan sonra silinir.</p>
       </div>
 
+      <details className="kvkk-details">
+        <summary>Aydınlatma Metni (KVKK) — okumak için tıklayın</summary>
+        <div className="kvkk-body">
+          <p><strong>Veri Sorumlusu:</strong> VizeKontrol.</p>
+          <p><strong>İşlenen veriler:</strong> Yüklediğiniz belgeler (pasaport, rezervasyon, banka
+          dökümü vb. görsel/PDF içerikleri) ve başvuru formunda verdiğiniz bilgiler (hedef ülke,
+          vize türü, çalışma durumu, seyahat tarihleri, masraf karşılayıcı).</p>
+          <p><strong>İşleme amacı:</strong> Belgelerinizin başvuru öncesi eksiksizlik, teknik
+          uygunluk ve tutarlılık açısından ön kontrolünün yapılması.</p>
+          <p><strong>Yurt dışına aktarım:</strong> Belgeleriniz, bu analizi gerçekleştirmek üzere
+          Amerika Birleşik Devletleri merkezli yapay zekâ servis sağlayıcısı Anthropic'e (Claude)
+          aktarılır. Bu aktarım yalnızca analiz süresi boyunca gerçekleşir; belgeleriniz
+          Anthropic tarafında kalıcı olarak saklanmaz.</p>
+          <p><strong>Saklama süresi:</strong> Belgeleriniz sistemimizde kalıcı olarak
+          saklanmaz; analiz tamamlandığı anda silinir.</p>
+          <p><strong>Haklarınız:</strong> 6698 sayılı KVKK'nın 11. maddesi uyarınca
+          verilerinizin işlenip işlenmediğini öğrenme, işlenmişse buna ilişkin bilgi talep etme,
+          düzeltilmesini veya silinmesini isteme haklarına sahipsiniz.</p>
+        </div>
+      </details>
+
       <label className="consent-row">
         <input
           type="checkbox"
           checked={consent}
           onChange={(e) => setConsent(e.target.checked)}
         />
-        <span>Belgelerimin yukarıda açıklandığı şekilde işlenmesini kabul ediyorum.</span>
+        <span>
+          Belgelerimin yukarıdaki Aydınlatma Metni'nde açıklandığı şekilde işlenmesini ve bu
+          amaçla yurt dışındaki bir yapay zekâ servis sağlayıcısına (Anthropic) aktarılmasını
+          kabul ediyorum.
+        </span>
       </label>
 
       {turnstileConfigured && (
@@ -1045,10 +1356,26 @@ function AppInner() {
   const [analysisResult, setAnalysisResult] = useState(null);
   const [demoMode, setDemoMode] = useState(false);
   const [checkError, setCheckError] = useState(null);
+  const [paymentRequired, setPaymentRequired] = useState(false);
+
+  const [session, setSession] = useState(null);
+  const [showAuthModal, setShowAuthModal] = useState(false);
+  const [pendingAction, setPendingAction] = useState(null); // "start" | null
+  const [view, setView] = useState("app"); // "app" | "history"
+  const [historyReport, setHistoryReport] = useState(null);
+
+  React.useEffect(() => {
+    if (!supabase) return;
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, newSession) => {
+      setSession(newSession);
+    });
+    return () => listener?.subscription?.unsubscribe();
+  }, []);
 
   React.useEffect(() => {
     window.scrollTo({ top: 0, behavior: "smooth" });
-  }, [started, step, analyzing]);
+  }, [started, step, analyzing, view]);
 
   const [formData, setFormData] = useState({
     country: "",
@@ -1065,11 +1392,41 @@ function AppInner() {
   const goHome = () => {
     setStarted(false);
     setStep(1);
+    setView("app");
   };
 
   const startFlow = () => {
+    if (!session) {
+      setPendingAction("start");
+      setShowAuthModal(true);
+      return;
+    }
     setStarted(true);
     setStep(1);
+    setView("app");
+  };
+
+  const handleAuthSuccess = () => {
+    setShowAuthModal(false);
+    if (pendingAction === "start") {
+      setStarted(true);
+      setStep(1);
+      setView("app");
+    }
+    setPendingAction(null);
+  };
+
+  const handleLogout = async () => {
+    if (supabase) await supabase.auth.signOut();
+    goHome();
+  };
+
+  const openHistory = () => {
+    if (!session) {
+      setShowAuthModal(true);
+      return;
+    }
+    setView("history");
   };
 
   const handleProfileNext = () => {
@@ -1088,6 +1445,7 @@ function AppInner() {
   const handleCheck = async () => {
     setAnalyzing(true);
     setCheckError(null);
+    setPaymentRequired(false);
 
     try {
       const uploaded = docs.filter((d) => d.status === "Yüklendi" && d.file);
@@ -1099,9 +1457,18 @@ function AppInner() {
         }))
       );
 
+      let authToken = "";
+      if (supabase) {
+        const { data: sessionData } = await supabase.auth.getSession();
+        authToken = sessionData?.session?.access_token || "";
+      }
+
       const res = await fetch(ANALYZE_ENDPOINT, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
         body: JSON.stringify({ formData, documents: documentsPayload, turnstileToken }),
       });
 
@@ -1119,6 +1486,17 @@ function AppInner() {
         data = await res.json();
       } catch {
         data = null;
+      }
+
+      if (res.status === 401) {
+        setCheckError("Oturumunuz sona ermiş görünüyor. Lütfen tekrar giriş yapın.");
+        setShowAuthModal(true);
+        return;
+      }
+
+      if (res.status === 402) {
+        setPaymentRequired(true);
+        return;
       }
 
       if (!res.ok) {
@@ -1156,6 +1534,7 @@ function AppInner() {
     setAnalysisResult(null);
     setDemoMode(false);
     setCheckError(null);
+    setPaymentRequired(false);
     setStep(1);
     setStarted(false);
   };
@@ -1230,6 +1609,9 @@ function AppInner() {
         .nav__links a{ color:var(--text-muted); text-decoration:none; }
         .nav__links a:hover{ color:var(--navy); }
         .nav__login{ background:var(--navy-soft); color:var(--navy); border:1px solid var(--border); padding:8px 16px; border-radius:999px; font-weight:700; cursor:pointer; font-size:14px; }
+        .nav__link-btn{ background:none; border:none; color:var(--text-muted); font-weight:600; font-size:14.5px; cursor:pointer; padding:0; }
+        .nav__link-btn:hover{ color:var(--navy); }
+        .nav__user-email{ font-size:13px; color:var(--text-muted); max-width:160px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
         .nav__toggle{ display:none; background:none; border:1px solid var(--border); border-radius:8px; padding:6px; }
         .nav__links--mobile{ display:none; }
         @media (max-width:820px){
@@ -1294,8 +1676,12 @@ function AppInner() {
         .info-card__num{ display:inline-flex; width:26px; height:26px; align-items:center; justify-content:center; border-radius:8px; background:var(--navy); color:#fff; font-size:13px; font-weight:800; margin-bottom:12px; }
         .info-card h3{ font-size:16px; margin-bottom:6px; }
         .info-card p{ margin:0; color:var(--text-muted); font-size:14px; }
-        .security-row{ display:flex; gap:12px; align-items:flex-start; color:var(--text-muted); }
-        .security-row p{ margin:0; color:var(--text-muted); max-width:70ch; }
+        .security-grid{ display:grid; grid-template-columns:repeat(3,1fr); gap:18px; }
+        @media (max-width:800px){ .security-grid{ grid-template-columns:1fr; } }
+        .security-item{ display:flex; gap:12px; align-items:flex-start; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:18px; }
+        .security-item svg{ color:var(--navy); flex-shrink:0; margin-top:2px; }
+        .security-item h3{ font-size:15px; margin:0 0 6px; }
+        .security-item p{ margin:0; color:var(--text-muted); font-size:13.5px; }
         .faq details{ background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-sm); padding:14px 16px; margin-bottom:10px; }
         .faq summary{ font-weight:700; cursor:pointer; font-size:15px; }
         .faq p{ margin:10px 0 0; color:var(--text-muted); font-size:14px; }
@@ -1354,8 +1740,17 @@ function AppInner() {
         @keyframes spin{ to{ transform:rotate(360deg); } }
 
         /* PRIVACY / CONSENT */
+        .schengen-note{ display:flex; gap:10px; align-items:flex-start; background:var(--navy-soft); border-radius:var(--radius-sm); padding:12px 14px; margin-bottom:20px; color:var(--navy-light); }
+        .schengen-note p{ margin:0; font-size:13.5px; color:var(--text); }
+        .schengen-note--warn{ background:var(--amber-bg); color:var(--amber-icon); }
+        .schengen-note--warn p{ color:var(--amber-text); font-weight:500; }
         .privacy-note{ display:flex; gap:10px; align-items:flex-start; background:var(--navy-soft); border-radius:var(--radius-sm); padding:12px 14px; margin-top:20px; color:var(--navy-light); }
         .privacy-note p{ margin:0; font-size:13.5px; color:var(--text); }
+        .kvkk-details{ margin-top:16px; border:1px solid var(--border); border-radius:var(--radius-sm); padding:12px 14px; background:#FCFCFD; }
+        .kvkk-details summary{ cursor:pointer; font-size:13px; font-weight:600; color:var(--navy); }
+        .kvkk-body{ margin-top:10px; display:flex; flex-direction:column; gap:8px; }
+        .kvkk-body p{ margin:0; font-size:12.5px; line-height:1.6; color:var(--text-muted); }
+        .kvkk-body strong{ color:var(--text); }
         .consent-row{ display:flex; align-items:flex-start; gap:10px; margin-top:16px; font-size:13.5px; color:var(--text); cursor:pointer; }
         .consent-row input{ margin-top:3px; }
 
@@ -1388,11 +1783,53 @@ function AppInner() {
         .report-header{ margin-bottom:18px; display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap; }
         .demo-badge{ font-size:11.5px; font-weight:500; padding:5px 10px; border-radius:var(--radius-badge); background:var(--amber-bg); color:var(--amber-text); white-space:nowrap; }
         .turnstile-wrap{ margin-top:16px; }
+
+        /* AUTH MODAL */
+        .modal-overlay{ position:fixed; inset:0; background:rgba(20,20,25,0.45); display:flex; align-items:center; justify-content:center; z-index:50; padding:20px; }
+        .modal-card{ position:relative; background:var(--surface); border-radius:var(--radius); box-shadow:var(--shadow); padding:32px; width:100%; max-width:400px; }
+        .modal-close{ position:absolute; top:16px; right:16px; background:none; border:none; cursor:pointer; color:var(--text-muted); padding:4px; }
+        .auth-form{ display:flex; flex-direction:column; gap:14px; margin-top:18px; }
+        .auth-form input{ font-family:inherit; font-size:14.5px; padding:10px 12px; border-radius:var(--radius-input); border:1px solid var(--border); width:100%; }
+        .auth-notice{ font-size:13px; color:var(--green); margin:0; }
+        .auth-switch{ display:block; width:100%; text-align:center; background:none; border:none; margin-top:16px; color:var(--navy); font-size:13.5px; font-weight:600; cursor:pointer; }
+
+        /* HISTORY */
+        .history-list{ display:flex; flex-direction:column; gap:10px; margin-top:8px; }
+        .history-item{ display:flex; align-items:center; justify-content:space-between; width:100%; text-align:left; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-sm); padding:14px 16px; cursor:pointer; font-family:inherit; }
+        .history-item:hover{ border-color:var(--navy-light); }
+        .history-item__title{ margin:0; font-weight:600; font-size:14.5px; }
+        .history-item__date{ margin:2px 0 0; font-size:12.5px; color:var(--text-muted); }
       `}</style>
 
-      <NavBar onHome={goHome} />
+      <NavBar
+        onHome={goHome}
+        session={session}
+        onLoginClick={() => setShowAuthModal(true)}
+        onLogout={handleLogout}
+        onHistoryClick={openHistory}
+      />
 
-      {!started ? (
+      {showAuthModal && (
+        <AuthModal onClose={() => { setShowAuthModal(false); setPendingAction(null); }} onSuccess={handleAuthSuccess} />
+      )}
+
+      {view === "history" ? (
+        historyReport ? (
+          <div className="flow">
+            <StepResult
+              report={normalizeApiReport(historyReport.report_data)}
+              demoMode={historyReport.demo_mode}
+              formData={historyReport.form_data}
+              onRestart={restart}
+              onBackToDocs={() => setHistoryReport(null)}
+            />
+          </div>
+        ) : (
+          <div className="flow">
+            <HistoryView onBack={goHome} onOpenReport={setHistoryReport} />
+          </div>
+        )
+      ) : !started ? (
         <Landing onStart={startFlow} />
       ) : (
         <div className="flow">
@@ -1402,7 +1839,11 @@ function AppInner() {
             <StepProfile formData={formData} setFormData={setFormData} onNext={handleProfileNext} />
           )}
 
-          {step === 2 && !analyzing && (
+          {step === 2 && !analyzing && paymentRequired && (
+            <PaymentRequired onBack={() => setPaymentRequired(false)} />
+          )}
+
+          {step === 2 && !analyzing && !paymentRequired && (
             <StepDocuments
               docs={docs}
               setDocs={setDocs}
