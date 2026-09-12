@@ -21,6 +21,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import { getStore } from "@netlify/blobs";
+import { getSupabaseAdmin, getUserFromRequest } from "./_shared/supabaseAdmin.js";
 
 const MAX_FILES = 15;
 const MAX_FILE_BYTES = 8 * 1024 * 1024; // 8MB — Netlify Functions payload sınırına uygun
@@ -102,6 +103,42 @@ async function checkDailyCap() {
   }
 }
 
+// --- Kullanım hakkı kontrolü (1. kontrol ücretsiz, sonrası kredi düşer) ----
+// Not: Bu basit sürüm aynı anda gelen iki istekte teorik olarak küçük bir
+// yarış durumu (race condition) yaşayabilir; bu ölçekteki bir MVP için kabul
+// edilebilir, ileride Postgres tarafında atomik bir fonksiyona taşınabilir.
+async function checkAndConsumeEntitlement(supabaseAdmin, userId) {
+  const { data: profile, error } = await supabaseAdmin
+    .from("profiles")
+    .select("free_check_used, credit_balance")
+    .eq("id", userId)
+    .single();
+
+  if (error || !profile) {
+    return { allowed: false, reason: "Kullanıcı profili bulunamadı." };
+  }
+
+  if (!profile.free_check_used) {
+    const { error: updateError } = await supabaseAdmin
+      .from("profiles")
+      .update({ free_check_used: true })
+      .eq("id", userId);
+    if (updateError) return { allowed: false, reason: "Hak güncellenirken bir hata oluştu." };
+    return { allowed: true };
+  }
+
+  if (profile.credit_balance > 0) {
+    const { error: decrementError } = await supabaseAdmin
+      .from("profiles")
+      .update({ credit_balance: profile.credit_balance - 1 })
+      .eq("id", userId);
+    if (decrementError) return { allowed: false, reason: "Kredi güncellenirken bir hata oluştu." };
+    return { allowed: true };
+  }
+
+  return { allowed: false, reason: "PAYMENT_REQUIRED" };
+}
+
 export const handler = async (event) => {
   if (event.httpMethod === "OPTIONS") {
     return { statusCode: 204, headers: corsHeaders(), body: "" };
@@ -123,6 +160,31 @@ export const handler = async (event) => {
   }
 
   const { formData, documents, turnstileToken } = payload || {};
+
+  // --- 0) Kimlik doğrulama (üyelik zorunlu) ------------------------------
+  const supabaseAdmin = getSupabaseAdmin();
+  if (!supabaseAdmin) {
+    return jsonResponse(500, {
+      error: "Sunucu yapılandırması eksik (Supabase bağlı değil). Lütfen daha sonra tekrar deneyin.",
+    });
+  }
+
+  const { user, error: authError } = await getUserFromRequest(event, supabaseAdmin);
+  if (!user) {
+    return jsonResponse(401, { error: authError || "Giriş yapmanız gerekiyor.", code: "AUTH_REQUIRED" });
+  }
+
+  // --- 0b) Kullanım hakkı (1. kontrol ücretsiz, sonrası kredi gerekir) ---
+  const entitlement = await checkAndConsumeEntitlement(supabaseAdmin, user.id);
+  if (!entitlement.allowed) {
+    if (entitlement.reason === "PAYMENT_REQUIRED") {
+      return jsonResponse(402, {
+        error: "Ücretsiz hakkınızı kullandınız. Devam etmek için ödeme yapmanız gerekiyor.",
+        code: "PAYMENT_REQUIRED",
+      });
+    }
+    return jsonResponse(500, { error: entitlement.reason });
+  }
 
   const humanOk = await verifyTurnstile(turnstileToken, ip);
   if (!humanOk) {
@@ -240,6 +302,17 @@ Yukarıdaki başvuru bilgileriyle ekteki belgeleri karşılaştırıp yalnızca 
     if (!scoresOk || !docsOk || !suggestionsOk) {
       console.error("Model yanıtı beklenen şemaya uymuyor.");
       return jsonResponse(502, { error: "Model yanıtı beklenen formatta değil, lütfen tekrar deneyin." });
+    }
+
+    try {
+      await supabaseAdmin.from("reports").insert({
+        user_id: user.id,
+        form_data: formData,
+        report_data: parsed,
+        demo_mode: false,
+      });
+    } catch (saveErr) {
+      console.error("Rapor geçmişe kaydedilemedi (sonuç yine de döndürülüyor):", saveErr.message);
     }
 
     return jsonResponse(200, parsed);
