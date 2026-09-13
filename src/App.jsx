@@ -1500,7 +1500,10 @@ function AppInner() {
       }
 
       if (!res.ok) {
-        setCheckError((data && data.error) || "Analiz sırasında bir hata oluştu, lütfen tekrar deneyin.");
+        setCheckError(
+          ((data && data.error) || "Analiz sırasında bir hata oluştu, lütfen tekrar deneyin.") +
+          (data && data.debugDetail ? ` (Detay: ${data.debugDetail})` : "")
+        );
         return;
       }
 
