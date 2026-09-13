@@ -104,10 +104,10 @@ async function checkDailyCap() {
 }
 
 // --- Kullanım hakkı kontrolü (1. kontrol ücretsiz, sonrası kredi düşer) ----
-// Not: Bu basit sürüm aynı anda gelen iki istekte teorik olarak küçük bir
-// yarış durumu (race condition) yaşayabilir; bu ölçekteki bir MVP için kabul
-// edilebilir, ileride Postgres tarafında atomik bir fonksiyona taşınabilir.
-async function checkAndConsumeEntitlement(supabaseAdmin, userId) {
+// Önemli: bu yalnızca OKUR, henüz hiçbir şeyi düşmez — hak yalnızca analiz
+// GERÇEKTEN başarılı olduktan sonra consumeEntitlement ile düşülür. Böylece
+// Claude API tarafında bir hata olursa kullanıcı hakkını kaybetmez.
+async function checkEntitlement(supabaseAdmin, userId) {
   const { data: profile, error } = await supabaseAdmin
     .from("profiles")
     .select("free_check_used, credit_balance")
@@ -117,26 +117,29 @@ async function checkAndConsumeEntitlement(supabaseAdmin, userId) {
   if (error || !profile) {
     return { allowed: false, reason: "Kullanıcı profili bulunamadı." };
   }
-
-  if (!profile.free_check_used) {
-    const { error: updateError } = await supabaseAdmin
-      .from("profiles")
-      .update({ free_check_used: true })
-      .eq("id", userId);
-    if (updateError) return { allowed: false, reason: "Hak güncellenirken bir hata oluştu." };
-    return { allowed: true };
-  }
-
-  if (profile.credit_balance > 0) {
-    const { error: decrementError } = await supabaseAdmin
-      .from("profiles")
-      .update({ credit_balance: profile.credit_balance - 1 })
-      .eq("id", userId);
-    if (decrementError) return { allowed: false, reason: "Kredi güncellenirken bir hata oluştu." };
-    return { allowed: true };
-  }
-
+  if (!profile.free_check_used) return { allowed: true, kind: "free" };
+  if (profile.credit_balance > 0) return { allowed: true, kind: "credit" };
   return { allowed: false, reason: "PAYMENT_REQUIRED" };
+}
+
+// Not: Bu basit sürüm aynı anda gelen iki istekte teorik olarak küçük bir
+// yarış durumu (race condition) yaşayabilir; bu ölçekteki bir MVP için kabul
+// edilebilir, ileride Postgres tarafında atomik bir fonksiyona taşınabilir.
+async function consumeEntitlement(supabaseAdmin, userId, kind) {
+  if (kind === "free") {
+    await supabaseAdmin.from("profiles").update({ free_check_used: true }).eq("id", userId);
+    return;
+  }
+  const { data: profile } = await supabaseAdmin
+    .from("profiles")
+    .select("credit_balance")
+    .eq("id", userId)
+    .single();
+  const current = profile?.credit_balance || 0;
+  await supabaseAdmin
+    .from("profiles")
+    .update({ credit_balance: Math.max(0, current - 1) })
+    .eq("id", userId);
 }
 
 export const handler = async (event) => {
@@ -174,8 +177,8 @@ export const handler = async (event) => {
     return jsonResponse(401, { error: authError || "Giriş yapmanız gerekiyor.", code: "AUTH_REQUIRED" });
   }
 
-  // --- 0b) Kullanım hakkı (1. kontrol ücretsiz, sonrası kredi gerekir) ---
-  const entitlement = await checkAndConsumeEntitlement(supabaseAdmin, user.id);
+  // --- 0b) Kullanım hakkı (yalnızca kontrol ediyoruz, henüz düşmüyoruz) ---
+  const entitlement = await checkEntitlement(supabaseAdmin, user.id);
   if (!entitlement.allowed) {
     if (entitlement.reason === "PAYMENT_REQUIRED") {
       return jsonResponse(402, {
@@ -302,6 +305,13 @@ Yukarıdaki başvuru bilgileriyle ekteki belgeleri karşılaştırıp yalnızca 
     if (!scoresOk || !docsOk || !suggestionsOk) {
       console.error("Model yanıtı beklenen şemaya uymuyor.");
       return jsonResponse(502, { error: "Model yanıtı beklenen formatta değil, lütfen tekrar deneyin." });
+    }
+
+    // Analiz gerçekten başarılı oldu — hakkı/krediyi şimdi düşüyoruz.
+    try {
+      await consumeEntitlement(supabaseAdmin, user.id, entitlement.kind);
+    } catch (consumeErr) {
+      console.error("Hak/kredi düşülemedi (sonuç yine de döndürülüyor):", consumeErr.message);
     }
 
     try {
