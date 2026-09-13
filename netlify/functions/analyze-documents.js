@@ -318,6 +318,11 @@ Yukarıdaki başvuru bilgileriyle ekteki belgeleri karşılaştırıp yalnızca 
     return jsonResponse(200, parsed);
   } catch (err) {
     console.error("Claude API hatası:", err.message);
-    return jsonResponse(502, { error: "Analiz sırasında bir hata oluştu. Lütfen tekrar deneyin." });
+    // GEÇİCİ: gerçek hata mesajını görebilmek için detayı da dönüyoruz.
+    // Sorun çözülünce bu satırı kaldırıp eski haline döneceğiz.
+    return jsonResponse(502, {
+      error: "Analiz sırasında bir hata oluştu. Lütfen tekrar deneyin.",
+      debugDetail: String(err && err.message ? err.message : err),
+    });
   }
 };
